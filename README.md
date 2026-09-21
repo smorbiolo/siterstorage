@@ -172,7 +172,7 @@ elif (
 
     sudo ufw status verbose
 
-    sudo shutdown -r +1
+    sudo reboot
 
 ); then
     echo "RESULTADO=SUCESSO"
