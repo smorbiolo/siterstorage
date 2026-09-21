@@ -14,7 +14,8 @@ O login de root permanece habilitado até o bloco 3.
 
 `````bash
 clear
-echo "===============INÍCIO===2026-09-21,16:09:54"
+echo "===============INÍCIO==============="
+echo "===============Bloco 1=============="
 
 # VM: VM-base SITER
 # Módulo: Bootstrap geral
@@ -61,7 +62,8 @@ else
     echo "RESULTADO=ERRO"
 fi
 
-echo "===============FIM===2026-09-21,16:09:54"
+echo "===============FIM=================="
+echo "===============Bloco 1=============="
 `````
 
 ## Bloco 2 — Testar acesso com SIG
@@ -72,7 +74,8 @@ Execute o bloco para confirmar o acesso SSH e o funcionamento do sudo.
 
 `````bash
 clear
-echo "===============INÍCIO===2026-09-21,16:09:54"
+echo "===============INÍCIO==============="
+echo "===============Bloco 2=============="
 
 # VM: VM-base SITER
 # Módulo: Bootstrap geral
@@ -90,7 +93,8 @@ else
     echo "RESULTADO=ERRO"
 fi
 
-echo "===============FIM===2026-09-21,16:09:54"
+echo "===============FIM=================="
+echo "===============Bloco 2=============="
 `````
 
 ## Bloco 3 — Desabilitar acesso SSH de root
@@ -101,7 +105,8 @@ Mantenha a sessão de `sig` aberta.
 
 `````bash
 clear
-echo "===============INÍCIO===2026-09-21,16:09:54"
+echo "===============INÍCIO==============="
+echo "===============Bloco 3=============="
 
 # VM: VM-base SITER
 # Módulo: Bootstrap geral
@@ -128,7 +133,8 @@ else
     fi
 fi
 
-echo "===============FIM===2026-09-21,16:09:54"
+echo "===============FIM=================="
+echo "===============Bloco 3=============="
 `````
 
 ## Bloco 4 — Atualizar sistema e reiniciar
@@ -143,7 +149,8 @@ O firewall permanece configurado para permitir somente SSH na entrada.
 
 `````bash
 clear
-echo "===============INÍCIO===2026-09-21,16:09:54"
+echo "===============INÍCIO==============="
+echo "===============Bloco 4=============="
 
 # VM: VM-base SITER
 # Módulo: Bootstrap geral
@@ -173,7 +180,8 @@ else
     echo "RESULTADO=ERRO"
 fi
 
-echo "===============FIM===2026-09-21,16:09:54"
+echo "===============FIM=================="
+echo "===============Bloco 4=============="
 `````
 
 ## Bloco 5 — Recuperação e verificação final
@@ -184,7 +192,8 @@ Execute o bloco para verificar o estado geral da VM.
 
 `````bash
 clear
-echo "===============INÍCIO===2026-09-21,16:09:54"
+echo "===============INÍCIO==============="
+echo "===============Bloco 5=============="
 
 # VM: VM-base SITER
 # Módulo: Bootstrap geral
@@ -227,7 +236,8 @@ else
     echo "RESULTADO=ERRO"
 fi
 
-echo "===============FIM===2026-09-21,16:09:54"
+echo "===============FIM=================="
+echo "===============Bloco 5=============="
 `````
 
 ## Snapshot e reutilização
