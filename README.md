@@ -254,229 +254,589 @@ O bootstrap específico de cada VM será realizado separadamente, conforme a nec
 
 ---
 
-# Bootstrap específico — SITER Storage
+# SITER Storage — Bootstrap específico
 
-**Sistema operacional:** Ubuntu Server 26.04 LTS 64 bits  
-**Usuário operacional:** `sig`  
+**Sistema:** Ubuntu Server 26.04 LTS 64 bits  
+**Usuário executor:** `sig`  
 **Pré-requisito:** bootstrap geral do SITER concluído.
 
-Este procedimento prepara a infraestrutura básica da VM Storage. A configuração dos serviços de publicação e das integrações com Drone e OGC pertence ao desenvolvimento do módulo.
+Este procedimento prepara a infraestrutura básica da VM Storage: Syncthing, firewall, temas coloridos, armazenamento persistente, NFS, usuário de transferência e diretórios iniciais.
 
-## 1. Rede e firewall
+Não inclui o desenvolvimento do módulo nem as integrações funcionais com Drone e OGC.
 
-A Storage mantém o firewall ativo, com as seguintes regras:
+## 1. Preparação
 
-| Serviço | Acesso |
-|---|---|
-| SSH — TCP 22 | Qualquer IP |
-| Syncthing — TCP 22000 | IP público e rede privada |
-| GUI Syncthing — TCP 858 | Somente localhost, via túnel SSH |
-| Demais portas de entrada | Bloqueadas |
+Antes de executar, confirme que:
 
-O compartilhamento de arquivos entre módulos utilizará exclusivamente a rede privada do SITER.
+- O bootstrap geral foi concluído.
+- O volume `storage-volume` está anexado à VM e formatado em ext4.
+- O volume está vazio, exceto pelo diretório `lost+found`.
 
-As regras específicas de transferência e compartilhamento serão adicionadas conforme a implementação dos respectivos serviços.
+O script não formata discos, não apaga dados e não altera a configuração do SSH.
 
-## 2. Syncthing
+## 2. Execução
 
-Acesse como `sig`.
-
-Instale e habilite o serviço:
+Acesse a VM Storage pelo PuTTY como `sig` e execute o bloco completo.
 
 `````bash
-sudo apt-get update
-sudo apt-get install -y syncthing
-sudo systemctl enable --now syncthing@sig.service
-`````
+clear
+echo "===============INÍCIO==============="
 
-Configuração adotada:
+# VM: Storage
+# Módulo: SITER Storage
+# Repositório: Não aplicável
+# Usuário: sig
+# Objetivo: Bootstrap específico da Storage
+# Natureza: ALTERAÇÃO
 
-| Parâmetro | Valor |
-|---|---|
-| GUI | `127.0.0.1:858` |
-| Sincronização | TCP 22000 |
-| Discovery público e local | Desabilitados |
-| Relay | Desabilitado |
-| NAT | Desabilitado |
-| Usuário do serviço | `sig` |
-| Diretório de configuração | `/home/sig/.local/state/syncthing` |
+bash -euo pipefail <<'SITER'
 
-A GUI deve permanecer vinculada ao localhost. A porta 858 não deve ser liberada no firewall.
+erro() {
+    echo "ERRO: $*" >&2
+    exit 1
+}
 
-Como a porta 858 é inferior a 1024, configure a permissão necessária para o serviço utilizá-la sem executar como root:
+# ========== 1. IDENTIDADE E VOLUME ==========
 
-`````bash
-sudo mkdir -p /etc/systemd/system/syncthing@sig.service.d
+test "$(id -un)" = sig || erro "Execute como sig"
+test "$(hostname)" = storage || erro "VM incorreta: $(hostname)"
+sudo -n true || erro "Sudo indisponível"
 
-printf '%s\n' \
-    '[Service]' \
-    'AmbientCapabilities=CAP_NET_BIND_SERVICE' \
-    'CapabilityBoundingSet=CAP_NET_BIND_SERVICE' \
-    | sudo tee /etc/systemd/system/syncthing@sig.service.d/10-siter-gui.conf
+VOLUME="/dev/disk/by-id/scsi-0DO_Volume_storage-volume"
+DESTINO="/srv/siter/storage"
+CFG="/home/sig/.local/state/syncthing"
+
+test -b "$VOLUME" || erro "Volume storage-volume não encontrado"
+
+DISCO="$(readlink -f "$VOLUME")"
+UUID="$(sudo blkid -s UUID -o value "$DISCO")"
+TIPO="$(sudo blkid -s TYPE -o value "$DISCO")"
+
+test "$TIPO" = ext4 || erro "Volume não formatado em ext4"
+test -n "$UUID" || erro "UUID não encontrado"
+
+DISCO_SISTEMA="$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" | head -n 1)"
+test "$DISCO" != "/dev/$DISCO_SISTEMA" ||
+    erro "O volume identificado é o disco do sistema"
+
+MONTAGEM="$(findmnt -rn -S "$DISCO" -o TARGET || true)"
+
+case "$MONTAGEM" in
+    ""|"/mnt/storage_volume") ;;
+    *) erro "Volume montado em local inesperado: $MONTAGEM" ;;
+esac
+
+test ! -e "$DESTINO" || erro "Diretório Storage já existente"
+test ! -e "$CFG/config.xml" || erro "Syncthing já configurado"
+! id siter-upload >/dev/null 2>&1 ||
+    erro "Usuário siter-upload já existe"
+
+! grep -Fq "$UUID" /etc/fstab ||
+    erro "Volume já configurado no fstab"
+
+sudo ufw status | grep -q '^Status: active' ||
+    erro "Firewall inativo"
+
+sudo ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW' ||
+    erro "Regra SSH não encontrada"
+
+echo "IDENTIDADE=CONFIRMADA"
+echo "VOLUME=$DISCO"
+
+
+# ========== 2. VOLUME PERSISTENTE ==========
+
+sudo install -d -o root -g root -m 000 "$DESTINO"
+
+if [ "$MONTAGEM" = "/mnt/storage_volume" ]; then
+    sudo umount /mnt/storage_volume
+fi
+
+sudo mount -t ext4 -o noatime "$DISCO" "$DESTINO" ||
+    erro "Falha ao montar o volume"
+
+test "$(findmnt -rn -o UUID -M "$DESTINO")" = "$UUID" ||
+    erro "Montagem incorreta"
+
+test -z "$(sudo find "$DESTINO" -mindepth 1 -maxdepth 1 \
+    ! -name lost+found -print -quit)" ||
+    erro "Volume contém dados preexistentes"
+
+sudo cp -p /etc/fstab /etc/fstab.siter-storage.bak
+
+printf 'UUID=%s %s ext4 defaults,noatime,nofail 0 2\n' \
+    "$UUID" "$DESTINO" |
+    sudo tee -a /etc/fstab >/dev/null
 
 sudo systemctl daemon-reload
-sudo systemctl restart syncthing@sig.service
-`````
 
-**Túnel SSH no PuTTY:**
+echo "VOLUME=CONFIGURADO"
 
-- Source port: `11858`
-- Destination: `127.0.0.1:858`
-- Tipo: Local
 
-Acesse a interface pelo navegador:
+# ========== 3. DIRETÓRIOS E USUÁRIO ==========
 
-`http://127.0.0.1:11858`
-
-Para sincronização direta, utilize o IP público da VM na porta TCP 22000. Autorize os dispositivos participantes no Syncthing.
-
-### Temas coloridos
-
-Instalar os sete temas personalizados baseados no tema `dark` do Syncthing:
-
-| Tema | Body | Navbar |
-|---|---|---|
-| Azul | `#003` | `#004` |
-| Vermelho | `#300` | `#400` |
-| Verde | `#030` | `#040` |
-| Amarelo | `#220` | `#330` |
-| Ciano | `#022` | `#033` |
-| Roxo | `#202` | `#303` |
-| Laranja | `#310` | `#420` |
-
-Utilizar como referência o script `create_syncthing_custom_theme.v2.sh` e seu arquivo `.vars`, ajustando:
-
-`````bash
-BASE_THEME_NAME="dark"
-SET_CUSTOM_THEME_AS_ACTIVE="no"
-ACTIVE_THEME_NAME="Azul"
-SYNCTHING_GUI_URL="http://127.0.0.1:858"
-SYNCTHING_CONFIG_DIR="/home/sig/.local/state/syncthing"
-RESTART_SYNCTHING="yes"
-`````
-
-O script e seu `.vars` devem ser preservados junto à documentação de instalação. Esses parâmetros não substituem os arquivos originais do instalador.
-
-Os temas foram instalados na Storage, sem ativação automática. A seleção será feita manualmente pela GUI.
-
-## 3. Volume persistente
-
-A Storage utiliza um volume adicional independente do disco do sistema operacional.
-
-Configuração aplicada à VM Storage:
-
-| Propriedade | Valor |
-|---|---|
-| Volume | `storage-volume` |
-| Capacidade inicial | 50 GB |
-| Sistema de arquivos | ext4 |
-| Ponto de montagem | `/srv/siter/storage` |
-| UUID | `54adace4-48db-4dd9-a6ad-ed32e60f0cd8` |
-
-O volume já foi entregue formatado e montado pelo provedor. Não foi necessário formatá-lo novamente.
-
-Antes de configurar outra VM, identificar seu próprio volume e UUID. Não reutilizar o UUID acima em outra instância.
-
-A montagem persistente foi configurada no `/etc/fstab` da Storage com a seguinte entrada:
-
-`````fstab
-UUID=54adace4-48db-4dd9-a6ad-ed32e60f0cd8 /srv/siter/storage ext4 defaults,noatime,nofail 0 2
-`````
-
-A remontagem automática foi validada após reinicialização da VM.
-
-**Importante:** não criar ou utilizar o acervo publicado quando o volume persistente estiver desmontado. A proteção contra escrita no diretório subjacente deverá ser garantida na configuração operacional do módulo.
-
-## 4. Estrutura inicial de armazenamento
-
-Acesse como `sig`.
-
-Criar os diretórios básicos no volume persistente, após confirmar que o volume correto está montado:
-
-`````bash
 sudo install -d -o root -g root -m 0700 \
-    /srv/siter/storage/recebimento
+    "$DESTINO/recebimento"
 
 sudo install -d -o root -g root -m 0750 \
-    /srv/siter/storage/publicado
-`````
+    "$DESTINO/publicado"
 
-Estrutura resultante:
-
-`````text
-/srv/siter/storage/
-├── recebimento/
-└── publicado/
-`````
-
-`recebimento/` armazena transferências ainda não validadas.
-
-`publicado/` mantém produtos completos e aprovados, que poderão ser consultados pelo módulo OGC.
-
-Os arquivos incompletos não devem ser disponibilizados como produtos publicados.
-
-## 5. Servidor NFS
-
-Acesse como `sig`.
-
-Instalar o servidor NFS:
-
-`````bash
-sudo apt-get install -y nfs-kernel-server
-`````
-
-O serviço foi instalado e está ativo.
-
-A exportação da área `publicado/` será configurada durante a integração com a VM OGC, utilizando a rede privada e permissões somente de leitura.
-
-Nenhum diretório deve ser exportado publicamente.
-
-## 6. Usuário de transferência
-
-Acesse como `sig`.
-
-Criar o usuário específico para receber arquivos enviados pelo módulo Drone:
-
-`````bash
 sudo useradd -m -U -s /bin/bash siter-upload
 sudo passwd -l siter-upload
 
 sudo chown siter-upload:siter-upload \
-    /srv/siter/storage/recebimento
+    "$DESTINO/recebimento"
 
-sudo chmod 700 /srv/siter/storage/recebimento
+sudo chmod 0700 "$DESTINO/recebimento"
+
+install -d -m 0700 /home/sig/swap
+
+echo "DIRETORIOS=CRIADOS"
+echo "USUARIO_TRANSFERENCIA=CRIADO"
+
+
+# ========== 4. INSTALAÇÃO DE PACOTES ==========
+
+sudo apt-get update
+
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    syncthing \
+    nfs-kernel-server
+
+systemctl is-active --quiet nfs-kernel-server ||
+    erro "Servidor NFS não iniciou"
+
+echo "PACOTES=INSTALADOS"
+
+
+# ========== 5. CONFIGURAÇÃO DO SYNCTHING ==========
+
+syncthing generate \
+    --home="$CFG" \
+    --no-default-folder
+
+python3 - "$CFG/config.xml" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+path = sys.argv[1]
+tree = ET.parse(path)
+root = tree.getroot()
+
+root.find("gui/address").text = "127.0.0.1:858"
+
+options = root.find("options")
+
+for address in options.findall("listenAddress"):
+    options.remove(address)
+
+ET.SubElement(
+    options, "listenAddress"
+).text = "tcp://0.0.0.0:22000"
+
+for name in (
+    "globalAnnounceEnabled",
+    "localAnnounceEnabled",
+    "relaysEnabled",
+    "natEnabled",
+    "startBrowser",
+):
+    element = options.find(name)
+    if element is None:
+        element = ET.SubElement(options, name)
+    element.text = "false"
+
+tree.write(
+    path,
+    encoding="utf-8",
+    xml_declaration=True
+)
+PY
+
+# Permitir uso da porta 858 sem executar como root.
+
+sudo install -d \
+    /etc/systemd/system/syncthing@sig.service.d
+
+printf '%s\n' \
+    '[Service]' \
+    'AmbientCapabilities=CAP_NET_BIND_SERVICE' \
+    'CapabilityBoundingSet=CAP_NET_BIND_SERVICE' |
+    sudo tee \
+    /etc/systemd/system/syncthing@sig.service.d/10-siter-gui.conf \
+    >/dev/null
+
+sudo systemctl daemon-reload
+
+echo "SYNCTHING=CONFIGURADO"
+
+
+# ========== 6. TEMAS COLORIDOS ==========
+
+VERSAO="$(syncthing --version | awk '{print $2}')"
+
+BASE="$(mktemp)"
+STAGE="$(mktemp -d "$CFG/.themes.XXXXXX")"
+
+trap 'rm -f "$BASE"; rm -rf "$STAGE"' EXIT
+
+curl -fsSL \
+    "https://raw.githubusercontent.com/syncthing/syncthing/${VERSAO}/gui/dark/assets/css/theme.css" \
+    -o "$BASE"
+
+test -s "$BASE" || erro "CSS original não encontrado"
+
+python3 - "$BASE" "$STAGE" "$CFG/gui" <<'PY'
+import re
+import sys
+import shutil
+from pathlib import Path
+
+base = Path(sys.argv[1]).read_text(encoding="utf-8")
+stage = Path(sys.argv[2])
+gui = Path(sys.argv[3])
+
+temas = [
+    ("Azul",     "#003", "#004"),
+    ("Vermelho", "#300", "#400"),
+    ("Verde",    "#030", "#040"),
+    ("Amarelo",  "#220", "#330"),
+    ("Ciano",    "#022", "#033"),
+    ("Roxo",     "#202", "#303"),
+    ("Laranja",  "#310", "#420"),
+]
+
+body = re.compile(
+    r'(body\s*\{[^}]*?background-color\s*:\s*)'
+    r'#[0-9a-fA-F]{3,6}(\s*!important\s*;)',
+    re.S
+)
+
+navbar = re.compile(
+    r'(\.navbar\s*\{[^}]*?background-color\s*:\s*)'
+    r'#[0-9a-fA-F]{3,6}(\s*!important\s*;)',
+    re.S
+)
+
+for nome, _, _ in temas:
+    if (gui / nome).exists():
+        raise SystemExit(f"Tema já existente: {nome}")
+
+for nome, cor_body, cor_navbar in temas:
+    css, n1 = body.subn(
+        lambda m: m[1] + cor_body + m[2],
+        base, count=1
+    )
+
+    css, n2 = navbar.subn(
+        lambda m: m[1] + cor_navbar + m[2],
+        css, count=1
+    )
+
+    if n1 != 1 or n2 != 1:
+        raise SystemExit(f"CSS incompatível: {nome}")
+
+    destino = stage / nome / "assets/css/theme.css"
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    destino.write_text(css, encoding="utf-8")
+
+gui.mkdir(parents=True, exist_ok=True)
+
+for nome, _, _ in temas:
+    shutil.move(str(stage / nome), str(gui / nome))
+    print(f"TEMA_INSTALADO={nome}")
+PY
+
+echo "TEMAS=INSTALADOS"
+
+
+# ========== 7. FIREWALL ==========
+
+# Preservar SSH e permitir sincronização direta com o PC.
+# A porta administrativa 858 permanece fechada no firewall.
+
+sudo ufw allow 22000/tcp
+
+echo "FIREWALL=CONFIGURADO"
+
+
+# ========== 8. INICIAR E VERIFICAR ==========
+
+sudo systemctl enable --now syncthing@sig.service
+
+for i in $(seq 1 15); do
+    if sudo ss -lntH | awk '{print $4}' |
+        grep -Fxq '127.0.0.1:858' &&
+       sudo ss -lntH | awk '{print $4}' |
+        grep -Fxq '0.0.0.0:22000'; then
+        break
+    fi
+    sleep 1
+done
+
+systemctl is-active --quiet syncthing@sig.service ||
+    erro "Syncthing não iniciou"
+
+sudo ss -lntH | awk '{print $4}' |
+    grep -Fxq '127.0.0.1:858' ||
+    erro "GUI indisponível"
+
+sudo ss -lntH | awk '{print $4}' |
+    grep -Fxq '0.0.0.0:22000' ||
+    erro "Sincronização indisponível"
+
+test "$(findmnt -rn -o UUID -M "$DESTINO")" = "$UUID" ||
+    erro "Volume não montado"
+
+for tema in Azul Vermelho Verde Amarelo Ciano Roxo Laranja; do
+    test -s "$CFG/gui/$tema/assets/css/theme.css" ||
+        erro "Tema ausente: $tema"
+done
+
+echo "========== ESTADO FINAL =========="
+findmnt "$DESTINO"
+systemctl is-active syncthing@sig.service
+systemctl is-active nfs-kernel-server
+sudo ufw status
+
+echo "BOOTSTRAP_ESPECIFICO=CONFIGURADO"
+
+SITER
+
+RESULTADO=$?
+
+if [ "$RESULTADO" -eq 0 ]; then
+    echo "RESULTADO=SUCESSO"
+else
+    echo "RESULTADO=ERRO"
+fi
+
+echo "===============FIM=================="
 `````
 
-O usuário `siter-upload` não possui sudo nem autenticação por senha.
+## 3. Acesso ao Syncthing
 
-A autenticação SSH por chave e as restrições da transferência serão configuradas durante a integração com a Drone.
+Configure o túnel SSH no PuTTY:
 
-Esse usuário terá escrita somente na área de recebimento. A promoção dos produtos para `publicado/` será responsabilidade do processo autorizado da Storage.
+| Campo | Valor |
+|---|---|
+| Source port | `11858` |
+| Destination | `127.0.0.1:858` |
+| Tipo | Local |
 
-## 7. Pasta de troca do Syncthing
+Abra `http://127.0.0.1:11858` no navegador.
 
-Acesse como `sig`.
+Cadastre a pasta `/home/sig/swap` e autorize o computador local como dispositivo de sincronização.
 
-Criar uma pasta independente do acervo publicado para transferência de arquivos entre o computador local e a VM:
+Os sete temas estarão disponíveis para seleção manual.
 
-`````bash
-install -d -m 700 /home/sig/swap
+## 4. Relatório de Avaliação
+
+Após executar o bootstrap específico, reinicie a VM e faça a verificação consolidada dos dois bootstraps.
+
+O relatório deverá confirmar o estado do sistema, firewall, SSH, Syncthing, temas, volume persistente, diretórios, permissões e servidor NFS.
+
 `````
+clear
+echo "===============INÍCIO==============="
 
-Cadastrar `/home/sig/swap` na interface do Syncthing e compartilhar com o dispositivo local autorizado.
+# VM: Storage
+# Módulo: Bootstrap geral + específico SITER Storage
+# Repositório: Não aplicável
+# Usuário: sig
+# Objetivo: Relatório final de homologação dos bootstraps
+# Natureza: SOMENTE LEITURA
 
-O Syncthing não substitui o mecanismo de publicação Drone → Storage nem deve publicar automaticamente arquivos recebidos nessa pasta.
+bash <<'SITER'
 
-## 8. Encerramento do bootstrap específico
+FALHAS=0
+STORAGE="/srv/siter/storage"
+CFG="/home/sig/.local/state/syncthing"
+VOLUME="/dev/disk/by-id/scsi-0DO_Volume_storage-volume"
 
-**Estado: CONCLUÍDO.**
+verificar() {
+    local descricao="$1"
+    shift
 
-Foram preparados:
+    if "$@" >/dev/null 2>&1; then
+        echo "[OK] $descricao"
+    else
+        echo "[ERRO] $descricao"
+        FALHAS=$((FALHAS + 1))
+    fi
+}
 
-- Syncthing, interface administrativa por túnel SSH e temas coloridos.
-- Firewall com regras básicas de SSH e sincronização.
-- Volume persistente de armazenamento.
-- Diretórios iniciais de recebimento e publicação.
-- Servidor NFS.
-- Usuário de transferência `siter-upload`.
-- Pasta de troca `/home/sig/swap`.
+# Identidade antes de qualquer outra operação
+if [ "$(id -un)" != sig ] ||
+   [ "$(hostname)" != storage ] ||
+   [ ! -b "$VOLUME" ]; then
+    echo "RESULTADO=ERRO | VM ou usuário incorreto"
+    echo "ESPERADO: sig@storage com volume storage-volume"
+    echo "DETECTADO: $(id -un)@$(hostname)"
+    exit 1
+fi
+
+echo "========== 1. BOOTSTRAP GERAL =========="
+
+. /etc/os-release
+
+verificar "Ubuntu Server 26.04" test "$VERSION_ID" = "26.04"
+verificar "Arquitetura 64 bits" test "$(uname -m)" = "x86_64"
+verificar "Usuário sig com sudo" sudo -n true
+verificar "SSH ativo" systemctl is-active --quiet ssh
+
+verificar "Login SSH de root desabilitado" \
+    bash -c "sudo sshd -T | grep -qx 'permitrootlogin no'"
+
+for pacote in ca-certificates curl git nano ufw; do
+    verificar "Pacote $pacote" \
+        bash -c "dpkg-query -W -f='\${Status}' '$pacote' | grep -qx 'install ok installed'"
+done
+
+FW="$(sudo ufw status verbose)"
+
+verificar "Firewall ativo" \
+    grep -q '^Status: active' <<<"$FW"
+
+verificar "Entradas bloqueadas por padrão" \
+    grep -q 'Default: deny (incoming)' <<<"$FW"
+
+verificar "SSH 22 liberado" \
+    grep -Eq '^22/tcp[[:space:]]+ALLOW[[:space:]]+Anywhere' <<<"$FW"
+
+echo "========== 2. ARMAZENAMENTO =========="
+
+DEV="$(readlink -f "$VOLUME")"
+UUID="$(sudo blkid -s UUID -o value "$DEV")"
+
+echo "DISPOSITIVO=$DEV"
+echo "UUID=$UUID"
+
+verificar "Volume ext4" \
+    test "$(sudo blkid -s TYPE -o value "$DEV")" = ext4
+
+verificar "Volume montado no local correto" \
+    test "$(findmnt -rn -o UUID -M "$STORAGE")" = "$UUID"
+
+verificar "Montagem persistente no fstab" \
+    awk -v uuid="$UUID" -v destino="$STORAGE" \
+    '$1=="UUID="uuid && $2==destino && $3=="ext4" {ok=1}
+     END {exit !ok}' /etc/fstab
+
+verificar "Diretório recebimento" \
+    test -d "$STORAGE/recebimento"
+
+verificar "Diretório publicado" \
+    test -d "$STORAGE/publicado"
+
+verificar "Permissões do recebimento" \
+    test "$(stat -c '%a %U:%G' "$STORAGE/recebimento")" = \
+    "700 siter-upload:siter-upload"
+
+verificar "Permissões do publicado" \
+    test "$(stat -c '%a %U:%G' "$STORAGE/publicado")" = \
+    "750 root:root"
+
+df -hT "$STORAGE"
+
+echo "========== 3. USUÁRIO DE TRANSFERÊNCIA =========="
+
+verificar "Usuário siter-upload existente" id siter-upload
+
+verificar "Senha do usuário bloqueada" \
+    bash -c "sudo passwd -S siter-upload | grep -Eq '^siter-upload[[:space:]]+L'"
+
+verificar "Usuário sem sudo" \
+    bash -c "! id -nG siter-upload | grep -qw sudo"
+
+echo "========== 4. SYNCTHING =========="
+
+verificar "Serviço ativo" \
+    systemctl is-active --quiet syncthing@sig.service
+
+verificar "Inicialização automática" \
+    systemctl is-enabled --quiet syncthing@sig.service
+
+PORTAS="$(sudo ss -lntH | awk '{print $4}')"
+
+verificar "GUI restrita ao localhost na porta 858" \
+    grep -Fxq '127.0.0.1:858' <<<"$PORTAS"
+
+verificar "Sincronização TCP 22000 disponível" \
+    grep -Fxq '0.0.0.0:22000' <<<"$PORTAS"
+
+verificar "Configuração de rede e discovery" \
+    python3 - "$CFG/config.xml" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+root = ET.parse(sys.argv[1]).getroot()
+gui = root.find("gui")
+opt = root.find("options")
+
+assert gui.findtext("address") == "127.0.0.1:858"
+
+addresses = [
+    e.text for e in opt.findall("listenAddress")
+]
+assert addresses == ["tcp://0.0.0.0:22000"]
+
+for name in (
+    "globalAnnounceEnabled",
+    "localAnnounceEnabled",
+    "relaysEnabled",
+    "natEnabled",
+):
+    assert opt.findtext(name) == "false", name
+PY
+
+verificar "Pasta de troca PC/VM" \
+    test "$(stat -c '%a %U:%G' /home/sig/swap)" = "700 sig:sig"
+
+echo "========== 5. TEMAS COLORIDOS =========="
+
+for tema in Azul Vermelho Verde Amarelo Ciano Roxo Laranja; do
+    verificar "Tema $tema" \
+        test -s "$CFG/gui/$tema/assets/css/theme.css"
+done
+
+echo "========== 6. SERVIDOR NFS =========="
+
+verificar "NFS instalado" \
+    bash -c "dpkg-query -W -f='\${Status}' nfs-kernel-server | grep -qx 'install ok installed'"
+
+verificar "Servidor NFS ativo" \
+    systemctl is-active --quiet nfs-kernel-server
+
+verificar "Nenhum diretório NFS exportado" \
+    test -z "$(sudo exportfs -v)"
+
+echo "========== 7. FIREWALL ESPECÍFICO =========="
+
+verificar "Syncthing TCP 22000 liberado" \
+    grep -Eq '^22000/tcp[[:space:]]+ALLOW[[:space:]]+Anywhere' <<<"$FW"
+
+verificar "GUI e NFS sem liberação pública no UFW" \
+    bash -c "! sudo ufw status | grep -Eq '^(858|8384|2049)(/tcp|/udp)?[[:space:]]+ALLOW'"
+
+sudo ufw status
+
+echo "========== RELATÓRIO FINAL =========="
+
+echo "VM=$(hostname)"
+echo "SISTEMA=$PRETTY_NAME"
+echo "USUARIO=$(id -un)"
+echo "FALHAS=$FALHAS"
+
+if [ "$FALHAS" -eq 0 ]; then
+    echo "BOOTSTRAP_GERAL=APROVADO"
+    echo "BOOTSTRAP_STORAGE=APROVADO"
+    echo "RESULTADO=SUCESSO"
+else
+    echo "BOOTSTRAP=VERIFICACAO_INCOMPLETA"
+    echo "RESULTADO=ERRO"
+fi
+
+SITER
+
+echo "===============FIM=================="
