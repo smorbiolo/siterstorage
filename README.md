@@ -286,10 +286,10 @@ echo "===============INÍCIO==============="
 # Módulo: SITER Storage
 # Repositório: Não aplicável
 # Usuário: sig
-# Objetivo: Bootstrap específico da Storage
+# Objetivo: Bootstrap específico preservando dados existentes
 # Natureza: ALTERAÇÃO
 
-bash -euo pipefail <<'SITER'
+if bash -euo pipefail <<'SITER'
 
 erro() {
     echo "ERRO: $*" >&2
@@ -316,83 +316,153 @@ test "$TIPO" = ext4 || erro "Volume não formatado em ext4"
 test -n "$UUID" || erro "UUID não encontrado"
 
 DISCO_SISTEMA="$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" | head -n 1)"
+
+test -n "$DISCO_SISTEMA" || erro "Disco do sistema não identificado"
+
 test "$DISCO" != "/dev/$DISCO_SISTEMA" ||
     erro "O volume identificado é o disco do sistema"
+
+test "$(lsblk -dn -o TYPE "$DISCO")" = disk ||
+    erro "Dispositivo inesperado"
 
 MONTAGEM="$(findmnt -rn -S "$DISCO" -o TARGET || true)"
 
 case "$MONTAGEM" in
-    ""|"/mnt/storage_volume") ;;
+    ""|"/mnt/storage_volume"|"$DESTINO") ;;
     *) erro "Volume montado em local inesperado: $MONTAGEM" ;;
 esac
 
-test ! -e "$DESTINO" || erro "Diretório Storage já existente"
-test ! -e "$CFG/config.xml" || erro "Syncthing já configurado"
-! id siter-upload >/dev/null 2>&1 ||
-    erro "Usuário siter-upload já existe"
+# Impedir que uma montagem esconda arquivos do disco do sistema.
 
-! grep -Fq "$UUID" /etc/fstab ||
-    erro "Volume já configurado no fstab"
+test ! -L "$DESTINO" || erro "Destino é um link simbólico"
 
-sudo ufw status | grep -q '^Status: active' ||
-    erro "Firewall inativo"
+if [ -e "$DESTINO" ] && ! mountpoint -q "$DESTINO"; then
+    test -d "$DESTINO" || erro "Destino não é um diretório"
 
-sudo ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW' ||
-    erro "Regra SSH não encontrada"
+    test -z "$(sudo find "$DESTINO" -mindepth 1 -maxdepth 1 -print -quit)" ||
+        erro "O destino contém arquivos fora do volume"
+fi
+
+if grep -Fq "$UUID" /etc/fstab; then
+    grep -Eq "^UUID=${UUID}[[:space:]]+${DESTINO}[[:space:]]+ext4[[:space:]]" /etc/fstab ||
+        erro "UUID já configurado em outro ponto de montagem"
+else
+    ! grep -Fq "$DESTINO" /etc/fstab ||
+        erro "Destino já configurado para outro volume"
+fi
+
+test ! -e "$CFG/config.xml" ||
+    erro "Syncthing já configurado nesta VM"
 
 echo "IDENTIDADE=CONFIRMADA"
 echo "VOLUME=$DISCO"
+echo "UUID=$UUID"
 
 
 # ========== 2. VOLUME PERSISTENTE ==========
 
-sudo install -d -o root -g root -m 000 "$DESTINO"
+if ! mountpoint -q "$DESTINO"; then
 
-if [ "$MONTAGEM" = "/mnt/storage_volume" ]; then
-    sudo umount /mnt/storage_volume
+    if [ ! -e "$DESTINO" ]; then
+        sudo install -d -o root -g root -m 000 "$DESTINO"
+    else
+        sudo chmod 000 "$DESTINO"
+    fi
+
+    if [ "$MONTAGEM" = "/mnt/storage_volume" ]; then
+        sudo umount /mnt/storage_volume ||
+            erro "Volume em uso: não foi possível desmontar"
+    fi
+
+    if ! sudo mount -t ext4 -o noatime "$DISCO" "$DESTINO"; then
+
+        if [ "$MONTAGEM" = "/mnt/storage_volume" ]; then
+            sudo mount -t ext4 "$DISCO" /mnt/storage_volume ||
+                echo "AVISO: montagem anterior não restaurada"
+        fi
+
+        erro "Falha ao montar o volume"
+    fi
 fi
-
-sudo mount -t ext4 -o noatime "$DISCO" "$DESTINO" ||
-    erro "Falha ao montar o volume"
 
 test "$(findmnt -rn -o UUID -M "$DESTINO")" = "$UUID" ||
     erro "Montagem incorreta"
 
-test -z "$(sudo find "$DESTINO" -mindepth 1 -maxdepth 1 \
-    ! -name lost+found -print -quit)" ||
-    erro "Volume contém dados preexistentes"
+# Configurar persistência somente se ainda não existir.
 
-sudo cp -p /etc/fstab /etc/fstab.siter-storage.bak
+if ! grep -Eq "^UUID=${UUID}[[:space:]]+${DESTINO}[[:space:]]+ext4[[:space:]]" /etc/fstab; then
 
-printf 'UUID=%s %s ext4 defaults,noatime,nofail 0 2\n' \
-    "$UUID" "$DESTINO" |
-    sudo tee -a /etc/fstab >/dev/null
+    sudo cp -p /etc/fstab /etc/fstab.siter-storage.bak
 
-sudo systemctl daemon-reload
+    printf 'UUID=%s %s ext4 defaults,noatime,nofail 0 2\n' \
+        "$UUID" "$DESTINO" |
+        sudo tee -a /etc/fstab >/dev/null
+
+    sudo systemctl daemon-reload
+fi
 
 echo "VOLUME=CONFIGURADO"
+echo "DADOS_EXISTENTES=PRESERVADOS"
 
 
 # ========== 3. DIRETÓRIOS E USUÁRIO ==========
 
-sudo install -d -o root -g root -m 0700 \
-    "$DESTINO/recebimento"
+if ! id siter-upload >/dev/null 2>&1; then
+    sudo useradd -m -U -s /bin/bash siter-upload
+fi
 
-sudo install -d -o root -g root -m 0750 \
-    "$DESTINO/publicado"
-
-sudo useradd -m -U -s /bin/bash siter-upload
 sudo passwd -l siter-upload
 
-sudo chown siter-upload:siter-upload \
-    "$DESTINO/recebimento"
+RECEBIMENTO="$DESTINO/recebimento"
+PUBLICADO="$DESTINO/publicado"
 
-sudo chmod 0700 "$DESTINO/recebimento"
+# Criar somente os diretórios que não existem.
+# Nunca alterar recursivamente a propriedade dos dados existentes.
+
+if sudo test -e "$RECEBIMENTO"; then
+
+    sudo test -d "$RECEBIMENTO" ||
+        erro "Recebimento não é um diretório"
+
+    ESPERADO="$(id -u siter-upload):$(id -g siter-upload)"
+
+    ATUAL="$(sudo stat -c '%u:%g' "$RECEBIMENTO")"
+
+    test "$ATUAL" = "$ESPERADO" ||
+        erro "UID/GID do recebimento incompatível. Dados preservados. Esperado=$ESPERADO Atual=$ATUAL"
+
+    test "$(sudo stat -c '%a' "$RECEBIMENTO")" = 700 ||
+        erro "Permissões preexistentes do recebimento incompatíveis"
+
+else
+
+    sudo install -d \
+        -o siter-upload -g siter-upload -m 0700 \
+        "$RECEBIMENTO"
+fi
+
+if sudo test -e "$PUBLICADO"; then
+
+    sudo test -d "$PUBLICADO" ||
+        erro "Publicado não é um diretório"
+
+    test "$(sudo stat -c '%u:%g' "$PUBLICADO")" = "0:0" ||
+        erro "Propriedade preexistente do publicado incompatível"
+
+    test "$(sudo stat -c '%a' "$PUBLICADO")" = 750 ||
+        erro "Permissões preexistentes do publicado incompatíveis"
+
+else
+
+    sudo install -d \
+        -o root -g root -m 0750 \
+        "$PUBLICADO"
+fi
 
 install -d -m 0700 /home/sig/swap
 
-echo "DIRETORIOS=CRIADOS"
-echo "USUARIO_TRANSFERENCIA=CRIADO"
+echo "DIRETORIOS=CONFIGURADOS"
+echo "ARQUIVOS_PREEXISTENTES=INALTERADOS"
 
 
 # ========== 4. INSTALAÇÃO DE PACOTES ==========
@@ -442,8 +512,10 @@ for name in (
     "startBrowser",
 ):
     element = options.find(name)
+
     if element is None:
         element = ET.SubElement(options, name)
+
     element.text = "false"
 
 tree.write(
@@ -452,8 +524,6 @@ tree.write(
     xml_declaration=True
 )
 PY
-
-# Permitir uso da porta 858 sem executar como root.
 
 sudo install -d \
     /etc/systemd/system/syncthing@sig.service.d
@@ -523,20 +593,24 @@ for nome, _, _ in temas:
         raise SystemExit(f"Tema já existente: {nome}")
 
 for nome, cor_body, cor_navbar in temas:
+
     css, n1 = body.subn(
         lambda m: m[1] + cor_body + m[2],
-        base, count=1
+        base,
+        count=1
     )
 
     css, n2 = navbar.subn(
         lambda m: m[1] + cor_navbar + m[2],
-        css, count=1
+        css,
+        count=1
     )
 
     if n1 != 1 or n2 != 1:
         raise SystemExit(f"CSS incompatível: {nome}")
 
     destino = stage / nome / "assets/css/theme.css"
+
     destino.parent.mkdir(parents=True, exist_ok=True)
     destino.write_text(css, encoding="utf-8")
 
@@ -553,9 +627,12 @@ echo "TEMAS=INSTALADOS"
 # ========== 7. FIREWALL ==========
 
 # Preservar SSH e permitir sincronização direta com o PC.
-# A porta administrativa 858 permanece fechada no firewall.
+# A GUI permanece restrita ao localhost, sem porta pública.
 
 sudo ufw allow 22000/tcp
+
+sudo ufw status | grep -q '^Status: active' ||
+    erro "Firewall inativo"
 
 echo "FIREWALL=CONFIGURADO"
 
@@ -565,12 +642,14 @@ echo "FIREWALL=CONFIGURADO"
 sudo systemctl enable --now syncthing@sig.service
 
 for i in $(seq 1 15); do
-    if sudo ss -lntH | awk '{print $4}' |
-        grep -Fxq '127.0.0.1:858' &&
-       sudo ss -lntH | awk '{print $4}' |
-        grep -Fxq '0.0.0.0:22000'; then
+
+    PORTAS="$(sudo ss -lntH | awk '{print $4}')"
+
+    if grep -Fxq '127.0.0.1:858' <<<"$PORTAS" &&
+       grep -Fxq '0.0.0.0:22000' <<<"$PORTAS"; then
         break
     fi
+
     sleep 1
 done
 
@@ -589,23 +668,27 @@ test "$(findmnt -rn -o UUID -M "$DESTINO")" = "$UUID" ||
     erro "Volume não montado"
 
 for tema in Azul Vermelho Verde Amarelo Ciano Roxo Laranja; do
+
     test -s "$CFG/gui/$tema/assets/css/theme.css" ||
         erro "Tema ausente: $tema"
+
 done
 
 echo "========== ESTADO FINAL =========="
+
 findmnt "$DESTINO"
+df -hT "$DESTINO"
+
 systemctl is-active syncthing@sig.service
 systemctl is-active nfs-kernel-server
+
 sudo ufw status
 
 echo "BOOTSTRAP_ESPECIFICO=CONFIGURADO"
+echo "DADOS_PREEXISTENTES=PRESERVADOS"
 
 SITER
-
-RESULTADO=$?
-
-if [ "$RESULTADO" -eq 0 ]; then
+then
     echo "RESULTADO=SUCESSO"
 else
     echo "RESULTADO=ERRO"
